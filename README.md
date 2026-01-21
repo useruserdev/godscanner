@@ -38,7 +38,7 @@ When someone sets up a VLESS Reality server with SNI pointing to a CloudFlare-ba
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/godscanner.git
+git clone https://github.com/useruserdev/godscanner.git
 cd godscanner
 
 # No dependencies required! Uses only Python standard library

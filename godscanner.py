@@ -1005,7 +1005,7 @@ class GodScanner:
             if choice == '0':
                 clear_screen()
                 print(f"\n{Colors.CYAN}Thanks for using GodScanner!{Colors.END}")
-                print(f"{Colors.DIM}github.com/yourusername/godscanner{Colors.END}\n")
+                print(f"{Colors.DIM}github.com/useruserdev/godscanner{Colors.END}\n")
                 sys.exit(0)
             elif choice == '1':
                 self.scan_by_provider()
