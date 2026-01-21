@@ -826,31 +826,170 @@ class GodScanner:
             input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
             return
         
-        print(f"{Colors.DIM}Enter your VLESS parameters (or press Enter for placeholders){Colors.END}\n")
+        print(f"{Colors.CYAN}Found {len(self.results)} CF proxy IPs{Colors.END}")
+        print(f"{Colors.DIM}Enter your VLESS parameters below{Colors.END}\n")
         
-        uuid = input("UUID: ").strip() or "YOUR-UUID-HERE"
-        domain = input("Domain (Host/SNI): ").strip() or "YOUR-DOMAIN.com"
-        path = input("WebSocket Path [/]: ").strip() or "/"
+        # UUID
+        print(f"{Colors.BOLD}[1/6] UUID{Colors.END}")
+        print(f"{Colors.DIM}Your VLESS server UUID{Colors.END}")
+        uuid = input(f"  UUID: ").strip()
+        if not uuid:
+            print(f"{Colors.YELLOW}  Using placeholder: YOUR-UUID-HERE{Colors.END}")
+            uuid = "YOUR-UUID-HERE"
         
+        # Host
+        print(f"\n{Colors.BOLD}[2/6] Host Header{Colors.END}")
+        print(f"{Colors.DIM}Domain for Host header (your CF domain){Colors.END}")
+        host = input(f"  Host: ").strip()
+        if not host:
+            print(f"{Colors.YELLOW}  Using placeholder: YOUR-HOST.com{Colors.END}")
+            host = "YOUR-HOST.com"
+        
+        # SNI
+        print(f"\n{Colors.BOLD}[3/6] SNI (Server Name Indication){Colors.END}")
+        print(f"{Colors.DIM}TLS SNI domain (usually same as Host){Colors.END}")
+        print(f"{Colors.DIM}Press Enter to use same as Host: {host}{Colors.END}")
+        sni = input(f"  SNI: ").strip()
+        if not sni:
+            sni = host
+            print(f"{Colors.GREEN}  Using: {sni}{Colors.END}")
+        
+        # Path
+        print(f"\n{Colors.BOLD}[4/6] WebSocket Path{Colors.END}")
+        print(f"{Colors.DIM}Path on your VLESS server (e.g., /ws, /vless){Colors.END}")
+        path = input(f"  Path [/]: ").strip() or "/"
         if not path.startswith('/'):
             path = '/' + path
         
-        print(f"\n{Colors.BOLD}═══ VLESS Configs ═══{Colors.END}\n")
+        # 0-RTT (Early Data)
+        print(f"\n{Colors.BOLD}[5/6] 0-RTT Early Data{Colors.END}")
+        print(f"{Colors.DIM}Reduces latency by sending data in TLS handshake{Colors.END}")
+        print(f"{Colors.DIM}Recommended: Yes{Colors.END}")
+        add_ed = input(f"  Add 0-RTT (?ed=2048)? [Y/n]: ").strip().lower()
+        use_early_data = add_ed != 'n'
+        
+        if use_early_data:
+            # Add ?ed=2048 to path
+            if '?' in path:
+                path = path + "&ed=2048"
+            else:
+                path = path + "?ed=2048"
+            print(f"{Colors.GREEN}  Path with 0-RTT: {path}{Colors.END}")
+        
+        # Fragment
+        print(f"\n{Colors.BOLD}[6/6] TLS Fragment{Colors.END}")
+        print(f"{Colors.DIM}Splits TLS ClientHello to bypass DPI{Colors.END}")
+        print(f"{Colors.DIM}Format: length,interval,packets (e.g., 3,1,tlshello){Colors.END}")
+        add_frag = input(f"  Add fragment? [y/N]: ").strip().lower()
+        use_fragment = add_frag == 'y'
+        
+        fragment_value = ""
+        if use_fragment:
+            print(f"{Colors.DIM}  Common values: 1-3,1-1,tlshello or 10-50,10-30,tlshello{Colors.END}")
+            fragment_value = input(f"  Fragment value [1-3,1-1,tlshello]: ").strip() or "1-3,1-1,tlshello"
+            print(f"{Colors.GREEN}  Fragment: {fragment_value}{Colors.END}")
+        
+        # Config name prefix
+        print(f"\n{Colors.BOLD}[Optional] Config Name{Colors.END}")
+        print(f"{Colors.DIM}Prefix for config names (e.g., MyVPN, Speed){Colors.END}")
+        name_prefix = input(f"  Name prefix [GodScanner]: ").strip() or "GodScanner"
+        
+        # URL encode path
+        import urllib.parse
+        encoded_path = urllib.parse.quote(path, safe='')
+        
+        # Generate configs
+        print(f"\n{Colors.BOLD}{'═'*60}{Colors.END}")
+        print(f"{Colors.BOLD}           GENERATED VLESS CONFIGS{Colors.END}")
+        print(f"{Colors.BOLD}{'═'*60}{Colors.END}\n")
         
         configs = []
-        for i, r in enumerate(sorted(self.results, key=lambda x: x.response_time_ms or 9999), 1):
-            config = f"vless://{uuid}@{r.ip}:{r.port}?security=tls&type=ws&path={path}&host={domain}&sni={domain}#GodScanner-{i}-{r.response_time_ms}ms"
-            configs.append(config)
-            print(f"{Colors.GREEN}#{i}{Colors.END} [{r.response_time_ms}ms]")
-            print(f"{config}\n")
+        sorted_results = sorted(self.results, key=lambda x: x.response_time_ms or 9999)
         
-        save = input(f"Save to file? [Y/n]: ").strip().lower()
-        if save != 'n':
-            filename = f"vless_configs_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        for i, r in enumerate(sorted_results, 1):
+            # Build config URL
+            params = [
+                "encryption=none",
+                "type=ws",
+                f"host={host}",
+                f"path={encoded_path}",
+                "security=tls",
+                "fp=chrome",
+                f"sni={sni}",
+                "allowInsecure=false",
+            ]
+            
+            if use_fragment:
+                params.append(f"fragment={fragment_value}")
+            
+            # Config name with emoji flag and latency
+            latency = r.response_time_ms or 0
+            config_name = f"{name_prefix}-{i}-{latency}ms"
+            encoded_name = urllib.parse.quote(config_name, safe='')
+            
+            config = f"vless://{uuid}@{r.ip}:{r.port}?{'&'.join(params)}#{encoded_name}"
+            configs.append(config)
+            
+            # Print with color
+            print(f"{Colors.GREEN}#{i}{Colors.END} {Colors.CYAN}[{latency}ms]{Colors.END} {r.ip}")
+            print(f"{Colors.DIM}{config}{Colors.END}\n")
+        
+        print(f"{Colors.BOLD}{'═'*60}{Colors.END}")
+        print(f"{Colors.GREEN}Total configs: {len(configs)}{Colors.END}")
+        print(f"{Colors.BOLD}{'═'*60}{Colors.END}")
+        
+        # Summary
+        print(f"\n{Colors.BOLD}Configuration Summary:{Colors.END}")
+        print(f"  • UUID: {Colors.CYAN}{uuid[:8]}...{Colors.END}" if len(uuid) > 8 else f"  • UUID: {Colors.CYAN}{uuid}{Colors.END}")
+        print(f"  • Host: {Colors.CYAN}{host}{Colors.END}")
+        print(f"  • SNI: {Colors.CYAN}{sni}{Colors.END}")
+        print(f"  • Path: {Colors.CYAN}{path}{Colors.END}")
+        print(f"  • 0-RTT: {Colors.GREEN}Yes{Colors.END}" if use_early_data else f"  • 0-RTT: {Colors.RED}No{Colors.END}")
+        print(f"  • Fragment: {Colors.GREEN}{fragment_value}{Colors.END}" if use_fragment else f"  • Fragment: {Colors.RED}No{Colors.END}")
+        
+        # Save
+        print(f"\n{Colors.BOLD}Save Options:{Colors.END}")
+        print(f"  {Colors.GREEN}[1]{Colors.END}  Save to file")
+        print(f"  {Colors.GREEN}[2]{Colors.END}  Copy to clipboard (if available)")
+        print(f"  {Colors.RED}[0]{Colors.END}  Skip")
+        
+        save_choice = input(f"\nChoice: ").strip()
+        
+        if save_choice == '1':
+            filename = f"vless_{name_prefix.lower()}_{time.strftime('%Y%m%d_%H%M%S')}.txt"
             with open(filename, 'w') as f:
                 for c in configs:
                     f.write(c + "\n")
             print(f"{Colors.GREEN}[✓] Saved: {filename}{Colors.END}")
+            
+        elif save_choice == '2':
+            try:
+                import subprocess
+                all_configs = "\n".join(configs)
+                # Try xclip (Linux)
+                try:
+                    subprocess.run(['xclip', '-selection', 'clipboard'], input=all_configs.encode(), check=True)
+                    print(f"{Colors.GREEN}[✓] Copied to clipboard!{Colors.END}")
+                except FileNotFoundError:
+                    # Try xsel (Linux)
+                    try:
+                        subprocess.run(['xsel', '--clipboard', '--input'], input=all_configs.encode(), check=True)
+                        print(f"{Colors.GREEN}[✓] Copied to clipboard!{Colors.END}")
+                    except FileNotFoundError:
+                        # Try pbcopy (macOS)
+                        try:
+                            subprocess.run(['pbcopy'], input=all_configs.encode(), check=True)
+                            print(f"{Colors.GREEN}[✓] Copied to clipboard!{Colors.END}")
+                        except FileNotFoundError:
+                            print(f"{Colors.YELLOW}[!] Clipboard tool not found. Install xclip or xsel.{Colors.END}")
+                            # Fallback to file
+                            filename = f"vless_{name_prefix.lower()}_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+                            with open(filename, 'w') as f:
+                                for c in configs:
+                                    f.write(c + "\n")
+                            print(f"{Colors.GREEN}[✓] Saved to file instead: {filename}{Colors.END}")
+            except Exception as e:
+                print(f"{Colors.RED}[!] Clipboard error: {e}{Colors.END}")
         
         input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
 
