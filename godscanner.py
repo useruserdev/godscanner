@@ -327,33 +327,44 @@ class Scanner:
             return None
 
     def scan(self, ips: List[str], callback=None):
-        """Scan list of IPs"""
+        """Scan list of IPs with batched processing"""
         self.total = len(ips)
         self.scanned = 0
         self.found = 0
         self.results = []
         self.stop_flag = False
-
+        
+        # Process in batches to avoid memory issues with large IP lists
+        batch_size = min(self.threads * 10, 10000)
+        
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = {executor.submit(self.check_ip, ip): ip for ip in ips}
-
-            for future in as_completed(futures):
+            for batch_start in range(0, len(ips), batch_size):
                 if self.stop_flag:
                     break
                     
-                with self.lock:
-                    self.scanned += 1
-
-                try:
-                    result = future.result()
-                    if result and result.is_cf_proxy:
-                        with self.lock:
-                            self.found += 1
-                            self.results.append(result)
-                        if callback:
-                            callback(result)
-                except Exception:
-                    pass
+                batch = ips[batch_start:batch_start + batch_size]
+                futures = {executor.submit(self.check_ip, ip): ip for ip in batch}
+                
+                for future in as_completed(futures):
+                    if self.stop_flag:
+                        # Cancel remaining futures
+                        for f in futures:
+                            f.cancel()
+                        break
+                    
+                    with self.lock:
+                        self.scanned += 1
+                    
+                    try:
+                        result = future.result(timeout=0.1)
+                        if result and result.is_cf_proxy:
+                            with self.lock:
+                                self.found += 1
+                                self.results.append(result)
+                            if callback:
+                                callback(result)
+                    except Exception:
+                        pass
 
         return self.results
 
@@ -366,8 +377,8 @@ class GodScanner:
         self.scanner = Scanner()
         self.results: List[ScanResult] = []
         self.settings = {
-            'threads': 200,
-            'timeout': 5.0,
+            'threads': 300,      # Balanced for most connections
+            'timeout': 3.0,      # Fast but reliable
             'port': 443,
         }
 
@@ -464,7 +475,15 @@ class GodScanner:
     def do_scan(self, ips: List[str], description: str):
         """Execute scan with progress display"""
         print(f"\n{Colors.CYAN}[*] {description}{Colors.END}")
-        print(f"{Colors.DIM}[*] Total IPs: {len(ips)} | Threads: {self.settings['threads']} | Timeout: {self.settings['timeout']}s{Colors.END}")
+        print(f"{Colors.DIM}[*] Total IPs: {len(ips):,} | Threads: {self.settings['threads']} | Timeout: {self.settings['timeout']}s{Colors.END}")
+        
+        # Estimate time
+        estimated_time = (len(ips) / self.settings['threads']) * self.settings['timeout']
+        if estimated_time > 60:
+            print(f"{Colors.YELLOW}[*] Estimated time: {estimated_time/60:.1f} minutes{Colors.END}")
+        else:
+            print(f"{Colors.DIM}[*] Estimated time: {estimated_time:.0f} seconds{Colors.END}")
+        
         print(f"{Colors.DIM}[*] Press Ctrl+C to stop scan{Colors.END}\n")
         
         self.scanner = Scanner(
@@ -475,39 +494,79 @@ class GodScanner:
         
         start = time.time()
         scan_done = threading.Event()
+        scan_error = [None]
         
         def scan_thread():
-            self.scanner.scan(ips, callback=self.on_found)
-            scan_done.set()
+            try:
+                self.scanner.scan(ips, callback=self.on_found)
+            except Exception as e:
+                scan_error[0] = e
+            finally:
+                scan_done.set()
         
-        t = threading.Thread(target=scan_thread)
+        t = threading.Thread(target=scan_thread, daemon=True)
         t.start()
+        
+        interrupted = False
+        last_scanned = 0
+        stall_count = 0
         
         try:
             while not scan_done.is_set():
-                time.sleep(0.3)
+                time.sleep(0.5)
                 if self.scanner.total > 0:
                     pct = (self.scanner.scanned / self.scanner.total) * 100
                     bar_len = 30
                     filled = int(bar_len * self.scanner.scanned / self.scanner.total)
                     bar = '█' * filled + '░' * (bar_len - filled)
-                    print(f"\r{Colors.DIM}[{bar}] {pct:5.1f}% | {self.scanner.scanned}/{self.scanner.total} | Found: {Colors.GREEN}{self.scanner.found}{Colors.END}   ", end="", flush=True)
+                    
+                    # Calculate speed
+                    elapsed = time.time() - start
+                    speed = self.scanner.scanned / elapsed if elapsed > 0 else 0
+                    
+                    # ETA
+                    remaining = self.scanner.total - self.scanner.scanned
+                    eta = remaining / speed if speed > 0 else 0
+                    eta_str = f"{eta:.0f}s" if eta < 60 else f"{eta/60:.1f}m"
+                    
+                    print(f"\r{Colors.DIM}[{bar}] {pct:5.1f}% | {self.scanner.scanned:,}/{self.scanner.total:,} | Found: {Colors.GREEN}{self.scanner.found}{Colors.DIM} | {speed:.0f}/s | ETA: {eta_str}{Colors.END}   ", end="", flush=True)
+                    
+                    # Check for stall
+                    if self.scanner.scanned == last_scanned:
+                        stall_count += 1
+                        if stall_count > 20:  # 10 seconds stall
+                            print(f"\n{Colors.YELLOW}[!] Scan appears stalled. Consider Ctrl+C and lowering timeout.{Colors.END}")
+                            stall_count = 0
+                    else:
+                        stall_count = 0
+                    last_scanned = self.scanner.scanned
+                    
         except KeyboardInterrupt:
+            interrupted = True
             print(f"\n\n{Colors.YELLOW}[!] Stopping scan...{Colors.END}")
             self.scanner.stop()
+            t.join(timeout=3)
         
-        t.join()
+        if not interrupted:
+            t.join()
         
         elapsed = time.time() - start
         self.results.extend(self.scanner.results)
         
         print(f"\n\n{Colors.GREEN}{'═'*60}{Colors.END}")
-        print(f"{Colors.GREEN}[✓] Scan completed in {elapsed:.1f}s{Colors.END}")
+        if interrupted:
+            print(f"{Colors.YELLOW}[!] Scan interrupted after {elapsed:.1f}s{Colors.END}")
+        else:
+            print(f"{Colors.GREEN}[✓] Scan completed in {elapsed:.1f}s{Colors.END}")
+        print(f"{Colors.GREEN}[✓] Scanned: {self.scanner.scanned:,} IPs ({self.scanner.scanned/elapsed:.0f}/s){Colors.END}")
         print(f"{Colors.GREEN}[✓] Found CF proxies: {self.scanner.found}{Colors.END}")
         print(f"{Colors.GREEN}[✓] Total results: {len(self.results)}{Colors.END}")
         print(f"{Colors.GREEN}{'═'*60}{Colors.END}")
         
-        input(f"\n{Colors.DIM}Press Enter to continue...{Colors.END}")
+        try:
+            input(f"\n{Colors.DIM}Press Enter to continue...{Colors.END}")
+        except KeyboardInterrupt:
+            pass
 
     def scan_by_provider(self):
         """Provider selection menu"""
@@ -683,21 +742,25 @@ class GodScanner:
         for provider in VPS_PROVIDERS.values():
             print(f"  • {provider['name']}")
         
-        confirm = input(f"\nAre you sure? [y/N]: ").strip().lower()
-        if confirm != 'y':
+        try:
+            confirm = input(f"\nAre you sure? [y/N]: ").strip().lower()
+            if confirm != 'y':
+                return
+            
+            for key, provider in VPS_PROVIDERS.items():
+                print(f"\n{Colors.BOLD}{'═'*60}{Colors.END}")
+                print(f"{Colors.BOLD}Provider: {provider['name']}{Colors.END}")
+                print(f"{Colors.BOLD}{'═'*60}{Colors.END}")
+                
+                all_ips = []
+                for cidr in provider['ranges']:
+                    network = ipaddress.ip_network(cidr, strict=False)
+                    all_ips.extend([str(ip) for ip in network.hosts()])
+                
+                self.do_scan(all_ips, f"Scanning {provider['name']}")
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}[!] Cancelled{Colors.END}")
             return
-        
-        for key, provider in VPS_PROVIDERS.items():
-            print(f"\n{Colors.BOLD}{'═'*60}{Colors.END}")
-            print(f"{Colors.BOLD}Provider: {provider['name']}{Colors.END}")
-            print(f"{Colors.BOLD}{'═'*60}{Colors.END}")
-            
-            all_ips = []
-            for cidr in provider['ranges']:
-                network = ipaddress.ip_network(cidr, strict=False)
-                all_ips.extend([str(ip) for ip in network.hosts()])
-            
-            self.do_scan(all_ips, f"Scanning {provider['name']}")
 
     def scan_by_asn(self):
         """Scan by ASN number"""
@@ -855,7 +918,23 @@ class GodScanner:
                         pass
                 
                 if all_ips:
-                    self.do_scan(all_ips, f"Scanning {asn_input} - All ranges")
+                    # Warn if large scan and suggest lower timeout
+                    if len(all_ips) > 10000:
+                        print(f"\n{Colors.YELLOW}[!] Large scan: {len(all_ips):,} IPs{Colors.END}")
+                        print(f"{Colors.DIM}Current timeout: {self.settings['timeout']}s{Colors.END}")
+                        print(f"{Colors.DIM}Recommended timeout for large scans: 2-3s{Colors.END}")
+                        
+                        lower = input(f"\nLower timeout to 2s for faster scan? [Y/n]: ").strip().lower()
+                        if lower != 'n':
+                            old_timeout = self.settings['timeout']
+                            self.settings['timeout'] = 2.0
+                            print(f"{Colors.GREEN}[✓] Timeout set to 2s{Colors.END}")
+                            self.do_scan(all_ips, f"Scanning {asn_input} - All ranges")
+                            self.settings['timeout'] = old_timeout  # Restore
+                        else:
+                            self.do_scan(all_ips, f"Scanning {asn_input} - All ranges")
+                    else:
+                        self.do_scan(all_ips, f"Scanning {asn_input} - All ranges")
             
             elif choice == 'L':
                 # Scan only small ranges (/24 and smaller)
@@ -928,9 +1007,15 @@ class GodScanner:
                 print(f"\n{Colors.CYAN}Scanning {len(selected_ranges)} ranges ({len(all_ips):,} IPs){Colors.END}")
                 self.do_scan(all_ips, f"Scanning {asn_input} - Selected ranges")
         
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}[!] Cancelled{Colors.END}")
+            return
         except Exception as e:
             print(f"{Colors.RED}[!] Error: {e}{Colors.END}")
-            input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
+            try:
+                input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
+            except KeyboardInterrupt:
+                pass
 
     def show_settings(self):
         """Settings menu"""
@@ -1230,37 +1315,44 @@ class GodScanner:
     def run(self):
         """Main loop"""
         while True:
-            clear_screen()
-            self.print_banner()
-            self.print_main_menu()
-            
-            choice = input(f"{Colors.BOLD}Select option: {Colors.END}").strip()
-            
-            if choice == '0':
+            try:
+                clear_screen()
+                self.print_banner()
+                self.print_main_menu()
+                
+                choice = input(f"{Colors.BOLD}Select option: {Colors.END}").strip()
+                
+                if choice == '0':
+                    clear_screen()
+                    print(f"\n{Colors.CYAN}Thanks for using GodScanner!{Colors.END}")
+                    print(f"{Colors.DIM}github.com/useruserdev/godscanner{Colors.END}\n")
+                    sys.exit(0)
+                elif choice == '1':
+                    self.scan_by_provider()
+                elif choice == '2':
+                    self.scan_custom_cidr()
+                elif choice == '3':
+                    self.scan_single_ip()
+                elif choice == '4':
+                    self.scan_from_file()
+                elif choice == '5':
+                    self.scan_all_providers()
+                elif choice == '6':
+                    self.scan_by_asn()
+                elif choice == '7':
+                    self.show_settings()
+                elif choice == '8':
+                    self.show_results()
+                elif choice == '9':
+                    self.save_results()
+                elif choice == '10':
+                    self.generate_vless()
+            except KeyboardInterrupt:
+                # Ctrl+C in main menu = exit
                 clear_screen()
                 print(f"\n{Colors.CYAN}Thanks for using GodScanner!{Colors.END}")
                 print(f"{Colors.DIM}github.com/useruserdev/godscanner{Colors.END}\n")
                 sys.exit(0)
-            elif choice == '1':
-                self.scan_by_provider()
-            elif choice == '2':
-                self.scan_custom_cidr()
-            elif choice == '3':
-                self.scan_single_ip()
-            elif choice == '4':
-                self.scan_from_file()
-            elif choice == '5':
-                self.scan_all_providers()
-            elif choice == '6':
-                self.scan_by_asn()
-            elif choice == '7':
-                self.show_settings()
-            elif choice == '8':
-                self.show_results()
-            elif choice == '9':
-                self.save_results()
-            elif choice == '10':
-                self.generate_vless()
 
 
 def main():
@@ -1268,8 +1360,17 @@ def main():
         app = GodScanner()
         app.run()
     except KeyboardInterrupt:
-        print(f"\n\n{Colors.CYAN}Interrupted by user{Colors.END}\n")
+        clear_screen()
+        print(f"\n{Colors.CYAN}Thanks for using GodScanner!{Colors.END}")
+        print(f"{Colors.DIM}github.com/useruserdev/godscanner{Colors.END}\n")
         sys.exit(0)
+    except EOFError:
+        # Handle Ctrl+D
+        print(f"\n{Colors.CYAN}Goodbye!{Colors.END}\n")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n{Colors.RED}[!] Unexpected error: {e}{Colors.END}\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
