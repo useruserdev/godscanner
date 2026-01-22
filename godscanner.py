@@ -275,66 +275,108 @@ class Scanner:
         self.lock = threading.Lock()
         self.stop_flag = False
 
-    def check_ip(self, ip: str) -> Optional[ScanResult]:
-        """Check single IP for CF proxy"""
+    def check_ip(self, ip: str, sni: str = "") -> Optional[ScanResult]:
+        """
+        Check single IP for CF proxy using specified SNI
+        
+        Args:
+            ip: IP address to check
+            sni: SNI domain to use for TLS connection
+        """
         if self.stop_flag:
             return None
             
         if is_cloudflare_ip(ip):
             return None
+            
+        if not sni:
+            return None
 
         start_time = time.time()
         result = ScanResult(ip=ip, port=self.port, is_cf_proxy=False)
 
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
         try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
             with socket.create_connection((ip, self.port), timeout=self.timeout) as sock:
                 sock.settimeout(self.timeout)
-                with ctx.wrap_socket(sock, server_hostname="www.cloudflare.com") as ssock:
+                with ctx.wrap_socket(sock, server_hostname=sni) as ssock:
                     cert = ssock.getpeercert()
+                    
+                    is_cf_cert = False
                     if cert:
                         subject = dict(x[0] for x in cert.get('subject', []))
                         result.cert_cn = subject.get('commonName', '')
-
-            conn = http.client.HTTPSConnection(ip, self.port, timeout=self.timeout, context=ctx)
-            conn.request("GET", "/", headers={"Host": "check.example.com", "User-Agent": "Mozilla/5.0"})
-            resp = conn.getresponse()
-            result.status_code = resp.status
+                        
+                        issuer = dict(x[0] for x in cert.get('issuer', []))
+                        issuer_cn = issuer.get('commonName', '').lower()
+                        issuer_o = issuer.get('organizationName', '').lower()
+                        
+                        # Check issuer for CF indicators
+                        cf_issuers = ['cloudflare', 'google trust']
+                        is_cf_cert = any(ci in issuer_cn or ci in issuer_o for ci in cf_issuers)
+                        
+                        if result.cert_cn and 'cloudflare' in result.cert_cn.lower():
+                            is_cf_cert = True
+                    
+                    # Try HTTP request
+                    is_cf = False
+                    try:
+                        conn = http.client.HTTPSConnection(ip, self.port, timeout=self.timeout, context=ctx)
+                        conn.request("HEAD", "/", headers={
+                            "Host": sni,
+                            "User-Agent": "Mozilla/5.0",
+                            "Connection": "close"
+                        })
+                        resp = conn.getresponse()
+                        result.status_code = resp.status
+                        
+                        headers = {k.lower(): v for k, v in resp.getheaders()}
+                        result.cf_ray = headers.get('cf-ray')
+                        result.server = headers.get('server', '')
+                        conn.close()
+                        
+                        # Check CF indicators
+                        if result.cf_ray:
+                            is_cf = True
+                        elif result.server and 'cloudflare' in result.server.lower():
+                            is_cf = True
+                        elif any(h in headers for h in ['cf-ray', 'cf-cache-status']):
+                            is_cf = True
+                        elif is_cf_cert:
+                            is_cf = True
+                            
+                    except Exception:
+                        # HTTP failed but TLS worked with CF cert
+                        if is_cf_cert:
+                            is_cf = True
+                    
+                    if is_cf:
+                        result.is_cf_proxy = True
+                        result.response_time_ms = int((time.time() - start_time) * 1000)
+                        return result
+                        
+        except (socket.timeout, ConnectionRefusedError, ssl.SSLError, OSError):
+            pass
+        except Exception:
+            pass
             
-            headers = {k.lower(): v for k, v in resp.getheaders()}
-            result.cf_ray = headers.get('cf-ray')
-            result.server = headers.get('server', '')
-            conn.close()
+        return None
 
-            is_cf = False
-            if result.cf_ray:
-                is_cf = True
-            if 'cloudflare' in result.server.lower():
-                is_cf = True
-            if result.cert_cn and 'cloudflare' in result.cert_cn.lower():
-                is_cf = True
-
-            result.is_cf_proxy = is_cf
-            result.response_time_ms = int((time.time() - start_time) * 1000)
-
-            return result if is_cf else None
-
-        except Exception as e:
-            result.error = str(e)[:50]
-            return None
-
-    def scan(self, ips: List[str], callback=None):
-        """Scan list of IPs with batched processing"""
+    def scan(self, ips: List[str], sni: str, callback=None):
+        """Scan list of IPs with specified SNI"""
         self.total = len(ips)
         self.scanned = 0
         self.found = 0
         self.results = []
         self.stop_flag = False
         
-        # Process in batches to avoid memory issues with large IP lists
+        if not sni:
+            return self.results
+        
+        # Process in batches to avoid memory issues
         batch_size = min(self.threads * 10, 10000)
         
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
@@ -343,11 +385,10 @@ class Scanner:
                     break
                     
                 batch = ips[batch_start:batch_start + batch_size]
-                futures = {executor.submit(self.check_ip, ip): ip for ip in batch}
+                futures = {executor.submit(self.check_ip, ip, sni): ip for ip in batch}
                 
                 for future in as_completed(futures):
                     if self.stop_flag:
-                        # Cancel remaining futures
                         for f in futures:
                             f.cancel()
                         break
@@ -380,6 +421,7 @@ class GodScanner:
             'threads': 300,      # Balanced for most connections
             'timeout': 3.0,      # Fast but reliable
             'port': 443,
+            'sni': '',           # User's CF domain for SNI
         }
 
     def print_banner(self):
@@ -400,10 +442,13 @@ class GodScanner:
 
     def print_main_menu(self):
         found_count = len(self.results)
+        sni_status = f"{Colors.GREEN}✓ {self.settings['sni']}{Colors.END}" if self.settings['sni'] else f"{Colors.RED}✗ NOT SET{Colors.END}"
         print(f"""
 {Colors.BOLD}╔════════════════════════════════════════════════════════════════════╗
 ║                         MAIN MENU                                  ║
 ╠════════════════════════════════════════════════════════════════════╣{Colors.END}
+║  SNI Domain: {sni_status:<56}║
+╠════════════════════════════════════════════════════════════════════╣
 ║                                                                    ║
 ║  {Colors.GREEN}[1]{Colors.END}  🔍  Scan by Provider                                        ║
 ║  {Colors.GREEN}[2]{Colors.END}  🎯  Scan Custom CIDR Range                                  ║
@@ -439,14 +484,16 @@ class GodScanner:
 """)
 
     def print_settings_menu(self):
+        sni_display = self.settings['sni'] if self.settings['sni'] else f"{Colors.RED}NOT SET{Colors.END}"
         print(f"""
 {Colors.BOLD}╔════════════════════════════════════════════════════════════════════╗
 ║                         SETTINGS                                   ║
 ╠════════════════════════════════════════════════════════════════════╣{Colors.END}
 ║                                                                    ║
-║  {Colors.GREEN}[1]{Colors.END}  Threads:      {Colors.CYAN}{self.settings['threads']:>6}{Colors.END}                                    ║
-║  {Colors.GREEN}[2]{Colors.END}  Timeout:      {Colors.CYAN}{self.settings['timeout']:>6.1f}s{Colors.END}                                   ║
-║  {Colors.GREEN}[3]{Colors.END}  Port:         {Colors.CYAN}{self.settings['port']:>6}{Colors.END}                                    ║
+║  {Colors.GREEN}[1]{Colors.END}  SNI Domain:   {Colors.CYAN}{sni_display:<43}{Colors.END} ║
+║  {Colors.GREEN}[2]{Colors.END}  Threads:      {Colors.CYAN}{self.settings['threads']:<6}{Colors.END}                                    ║
+║  {Colors.GREEN}[3]{Colors.END}  Timeout:      {Colors.CYAN}{self.settings['timeout']:<6.1f}s{Colors.END}                                   ║
+║  {Colors.GREEN}[4]{Colors.END}  Port:         {Colors.CYAN}{self.settings['port']:<6}{Colors.END}                                    ║
 ║                                                                    ║
 ║  {Colors.RED}[0]{Colors.END}  ← Back                                                      ║
 {Colors.BOLD}╚════════════════════════════════════════════════════════════════════╝{Colors.END}
@@ -474,7 +521,20 @@ class GodScanner:
 
     def do_scan(self, ips: List[str], description: str):
         """Execute scan with progress display"""
+        
+        # Check if SNI is set
+        if not self.settings['sni']:
+            print(f"\n{Colors.RED}{'═'*60}{Colors.END}")
+            print(f"{Colors.RED}[!] SNI Domain not set!{Colors.END}")
+            print(f"{Colors.RED}{'═'*60}{Colors.END}")
+            print(f"{Colors.DIM}You must set an SNI domain before scanning.{Colors.END}")
+            print(f"{Colors.DIM}Go to Settings [7] → SNI Domain [1]{Colors.END}")
+            print(f"{Colors.DIM}Enter your CloudFlare-backed domain (e.g., yourdomain.com){Colors.END}")
+            input(f"\n{Colors.DIM}Press Enter to continue...{Colors.END}")
+            return
+        
         print(f"\n{Colors.CYAN}[*] {description}{Colors.END}")
+        print(f"{Colors.DIM}[*] SNI: {self.settings['sni']}{Colors.END}")
         print(f"{Colors.DIM}[*] Total IPs: {len(ips):,} | Threads: {self.settings['threads']} | Timeout: {self.settings['timeout']}s{Colors.END}")
         
         # Estimate time
@@ -498,7 +558,7 @@ class GodScanner:
         
         def scan_thread():
             try:
-                self.scanner.scan(ips, callback=self.on_found)
+                self.scanner.scan(ips, self.settings['sni'], callback=self.on_found)
             except Exception as e:
                 scan_error[0] = e
             finally:
@@ -534,7 +594,7 @@ class GodScanner:
                     # Check for stall
                     if self.scanner.scanned == last_scanned:
                         stall_count += 1
-                        if stall_count > 20:  # 10 seconds stall
+                        if stall_count > 20:
                             print(f"\n{Colors.YELLOW}[!] Scan appears stalled. Consider Ctrl+C and lowering timeout.{Colors.END}")
                             stall_count = 0
                     else:
@@ -640,11 +700,22 @@ class GodScanner:
             input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
 
     def scan_single_ip(self):
-        """Check single IP"""
+        """Check single IP with user's SNI domain"""
         clear_screen()
         self.print_banner()
         
         print(f"\n{Colors.BOLD}═══ Check Single IP ═══{Colors.END}\n")
+        
+        # Check if SNI is set
+        if not self.settings['sni']:
+            print(f"{Colors.RED}[!] SNI Domain not set!{Colors.END}")
+            print(f"{Colors.DIM}You must set an SNI domain before checking.{Colors.END}")
+            print(f"{Colors.DIM}Go to Settings [7] → SNI Domain [1]{Colors.END}\n")
+            input(f"{Colors.DIM}Press Enter...{Colors.END}")
+            return
+        
+        print(f"{Colors.DIM}Using SNI: {self.settings['sni']}{Colors.END}\n")
+        
         ip = input("Enter IP address: ").strip()
         
         if not ip:
@@ -667,10 +738,10 @@ class GodScanner:
             return
         
         print(f"{Colors.GREEN}[✓] Not official CloudFlare IP{Colors.END}")
-        print(f"{Colors.DIM}[*] Testing connection...{Colors.END}\n")
+        print(f"{Colors.DIM}[*] Testing connection with SNI: {self.settings['sni']}...{Colors.END}\n")
         
         scanner = Scanner(threads=1, timeout=self.settings['timeout'], port=self.settings['port'])
-        result = scanner.check_ip(ip)
+        result = scanner.check_ip(ip, self.settings['sni'])
         
         if result and result.is_cf_proxy:
             print(f"{Colors.GREEN}{'═'*50}{Colors.END}")
@@ -678,9 +749,9 @@ class GodScanner:
             print(f"{Colors.GREEN}{'═'*50}{Colors.END}")
             print(f"  IP:        {result.ip}")
             print(f"  Port:      {result.port}")
-            print(f"  CF-RAY:    {result.cf_ray}")
-            print(f"  Server:    {result.server}")
-            print(f"  Cert CN:   {result.cert_cn}")
+            print(f"  CF-RAY:    {result.cf_ray or 'N/A'}")
+            print(f"  Server:    {result.server or 'N/A'}")
+            print(f"  Cert CN:   {result.cert_cn or 'N/A'}")
             print(f"  Latency:   {result.response_time_ms}ms")
             print(f"{Colors.GREEN}{'═'*50}{Colors.END}")
             
@@ -693,6 +764,7 @@ class GodScanner:
             print(f"{Colors.RED}[✗] Not a CF proxy{Colors.END}")
             print(f"{Colors.RED}{'═'*50}{Colors.END}")
             print(f"{Colors.DIM}This IP does not proxy traffic through CloudFlare{Colors.END}")
+            print(f"{Colors.DIM}with SNI: {self.settings['sni']}{Colors.END}")
         
         input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
 
@@ -1029,6 +1101,22 @@ class GodScanner:
             if choice == '0':
                 return
             elif choice == '1':
+                print(f"\n{Colors.BOLD}SNI Domain{Colors.END}")
+                print(f"{Colors.DIM}Enter your CloudFlare-backed domain for scanning{Colors.END}")
+                print(f"{Colors.DIM}This domain will be used as SNI when connecting to IPs{Colors.END}")
+                print(f"{Colors.DIM}Example: yourdomain.com, sub.yourdomain.com{Colors.END}\n")
+                
+                val = input("SNI Domain (or 'clear' to remove): ").strip().lower()
+                if val == 'clear' or val == '':
+                    self.settings['sni'] = ''
+                    print(f"{Colors.YELLOW}[✓] SNI cleared{Colors.END}")
+                else:
+                    # Remove protocol if present
+                    val = val.replace('https://', '').replace('http://', '').split('/')[0]
+                    self.settings['sni'] = val
+                    print(f"{Colors.GREEN}[✓] SNI set to: {val}{Colors.END}")
+                input(f"{Colors.DIM}Press Enter...{Colors.END}")
+            elif choice == '2':
                 try:
                     val = int(input("Number of threads (1-1000): "))
                     if 1 <= val <= 1000:
@@ -1039,7 +1127,7 @@ class GodScanner:
                 except ValueError:
                     print(f"{Colors.RED}[!] Invalid number{Colors.END}")
                 input(f"{Colors.DIM}Press Enter...{Colors.END}")
-            elif choice == '2':
+            elif choice == '3':
                 try:
                     val = float(input("Timeout in seconds (1-30): "))
                     if 1 <= val <= 30:
@@ -1050,7 +1138,7 @@ class GodScanner:
                 except ValueError:
                     print(f"{Colors.RED}[!] Invalid number{Colors.END}")
                 input(f"{Colors.DIM}Press Enter...{Colors.END}")
-            elif choice == '3':
+            elif choice == '4':
                 try:
                     val = int(input("Port (1-65535): "))
                     if 1 <= val <= 65535:
