@@ -277,11 +277,7 @@ class Scanner:
 
     def check_ip(self, ip: str, sni: str = "") -> Optional[ScanResult]:
         """
-        Check if IP accepts TLS connection with specified SNI
-        
-        In blocked regions, we can't verify CF headers.
-        We just check if the IP:443 accepts TLS handshake with our SNI.
-        If it does - it's a potential proxy to test later with VPN.
+        Enhanced CloudFlare proxy detection with multiple verification steps
         
         Args:
             ip: IP address to check
@@ -304,49 +300,278 @@ class Scanner:
         ctx.verify_mode = ssl.CERT_NONE
         
         try:
+            # Step 1: TLS handshake test
             with socket.create_connection((ip, self.port), timeout=self.timeout) as sock:
                 sock.settimeout(self.timeout)
                 with ctx.wrap_socket(sock, server_hostname=sni) as ssock:
-                    # TLS handshake successful!
                     cert = ssock.getpeercert()
                     
                     if cert:
                         subject = dict(x[0] for x in cert.get('subject', []))
                         result.cert_cn = subject.get('commonName', '')
                     
-                    # Try to get HTTP response (may fail in blocked regions)
+                    # Step 2: HTTP request with CloudFlare verification
+                    cf_indicators = 0
+                    total_checks = 0
+                    
                     try:
                         conn = http.client.HTTPSConnection(ip, self.port, timeout=self.timeout, context=ctx)
-                        conn.request("HEAD", "/", headers={
-                            "Host": sni,
-                            "User-Agent": "Mozilla/5.0",
-                            "Connection": "close"
-                        })
-                        resp = conn.getresponse()
-                        result.status_code = resp.status
                         
-                        headers = {k.lower(): v for k, v in resp.getheaders()}
-                        result.cf_ray = headers.get('cf-ray')
-                        result.server = headers.get('server', '')
+                        # Test multiple endpoints for better verification
+                        test_paths = ["/", "/robots.txt", "/favicon.ico"]
+                        
+                        for path in test_paths:
+                            try:
+                                conn.request("GET", path, headers={
+                                    "Host": sni,
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                    "Accept-Language": "en-US,en;q=0.5",
+                                    "Accept-Encoding": "gzip, deflate",
+                                    "Connection": "close"
+                                })
+                                resp = conn.getresponse()
+                                resp.read()  # Consume response body
+                                
+                                result.status_code = resp.status
+                                headers = {k.lower(): v for k, v in resp.getheaders()}
+                                
+                                # CloudFlare indicator checks
+                                total_checks += 5
+                                
+                                # Check 1: CF-RAY header (strongest indicator)
+                                if headers.get('cf-ray'):
+                                    result.cf_ray = headers.get('cf-ray')
+                                    cf_indicators += 3  # Strong indicator
+                                
+                                # Check 2: Server header patterns
+                                server = headers.get('server', '').lower()
+                                result.server = server
+                                if 'cloudflare' in server:
+                                    cf_indicators += 2
+                                elif server in ['nginx', 'apache', '']:
+                                    cf_indicators += 0.5  # Neutral
+                                
+                                # Check 3: CF-specific headers
+                                cf_headers = ['cf-cache-status', 'cf-request-id', 'cf-visitor', 'cf-connecting-ip']
+                                for header in cf_headers:
+                                    if headers.get(header):
+                                        cf_indicators += 1
+                                
+                                # Check 4: Response patterns typical of CF
+                                if resp.status in [200, 301, 302, 403, 404]:
+                                    cf_indicators += 0.5
+                                
+                                # Check 5: Security headers often added by CF
+                                security_headers = ['x-frame-options', 'x-content-type-options', 'strict-transport-security']
+                                for header in security_headers:
+                                    if headers.get(header):
+                                        cf_indicators += 0.3
+                                
+                                break  # If we got a response, no need to try other paths
+                                
+                            except Exception:
+                                continue
+                        
                         conn.close()
-                    except Exception:
-                        # HTTP failed but TLS worked - still good!
-                        pass
-                    
-                    # TLS handshake worked = potential proxy
-                    result.is_cf_proxy = True
-                    result.response_time_ms = int((time.time() - start_time) * 1000)
-                    return result
                         
-        except (socket.timeout, ConnectionRefusedError, ssl.SSLError, OSError):
-            pass
-        except Exception:
-            pass
+                        # Step 3: Additional verification - try to detect CF error pages
+                        if result.status_code in [403, 503, 520, 521, 522, 523, 524]:
+                            # These are common CF error codes
+                            cf_indicators += 1
+                        
+                        # Step 4: Certificate verification
+                        if result.cert_cn:
+                            # Check if cert matches SNI or is a CF cert pattern
+                            if sni.lower() in result.cert_cn.lower() or '*.cloudflare.com' in result.cert_cn.lower():
+                                cf_indicators += 1
+                        
+                        # Decision logic: require strong evidence
+                        confidence_score = (cf_indicators / max(total_checks, 1)) * 100
+                        
+                        # Require at least 40% confidence OR CF-RAY header
+                        if result.cf_ray or confidence_score >= 40:
+                            result.is_cf_proxy = True
+                            result.response_time_ms = int((time.time() - start_time) * 1000)
+                            return result
+                        
+                    except Exception as e:
+                        result.error = str(e)
+                        # If HTTP completely fails but TLS worked, it might still be a proxy
+                        # but we need very low confidence threshold
+                        pass
+                        
+        except (socket.timeout, ConnectionRefusedError, ssl.SSLError, OSError) as e:
+            result.error = str(e)
+        except Exception as e:
+            result.error = str(e)
             
         return None
 
+    def verify_proxy(self, ip: str, sni: str, timeout: float = 10.0) -> dict:
+        """
+        Deep verification of a potential CloudFlare proxy
+        Tests actual proxy functionality by making requests through it
+        
+        Args:
+            ip: IP address to verify
+            sni: SNI domain 
+            timeout: Verification timeout
+            
+        Returns:
+            dict with verification results
+        """
+        verification = {
+            'is_working_proxy': False,
+            'cf_ray_present': False,
+            'response_time_ms': None,
+            'status_codes': [],
+            'cf_headers': [],
+            'error': None
+        }
+        
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
+            start_time = time.time()
+            
+            # Test multiple requests to verify consistency
+            test_urls = [
+                "/",
+                "/robots.txt", 
+                "/sitemap.xml",
+                "/favicon.ico"
+            ]
+            
+            cf_ray_count = 0
+            successful_requests = 0
+            
+            for test_path in test_urls:
+                try:
+                    conn = http.client.HTTPSConnection(ip, 443, timeout=timeout, context=ctx)
+                    conn.request("GET", test_path, headers={
+                        "Host": sni,
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Cache-Control": "no-cache",
+                        "Pragma": "no-cache",
+                        "Connection": "close"
+                    })
+                    
+                    resp = conn.getresponse()
+                    body = resp.read()
+                    
+                    verification['status_codes'].append(resp.status)
+                    headers = {k.lower(): v for k, v in resp.getheaders()}
+                    
+                    # Check for CloudFlare indicators
+                    if headers.get('cf-ray'):
+                        cf_ray_count += 1
+                        if headers.get('cf-ray') not in verification['cf_headers']:
+                            verification['cf_headers'].append(f"cf-ray: {headers.get('cf-ray')}")
+                    
+                    # Check for other CF headers
+                    cf_header_names = ['cf-cache-status', 'cf-request-id', 'cf-visitor', 'cf-connecting-ip', 'cf-ipcountry']
+                    for header_name in cf_header_names:
+                        if headers.get(header_name):
+                            verification['cf_headers'].append(f"{header_name}: {headers.get(header_name)}")
+                    
+                    # Check response body for CF indicators
+                    if body and len(body) > 0:
+                        body_str = body.decode('utf-8', errors='ignore').lower()
+                        if 'cloudflare' in body_str or 'cf-ray' in body_str:
+                            verification['cf_headers'].append("cloudflare-in-body: true")
+                    
+                    successful_requests += 1
+                    conn.close()
+                    
+                except Exception as e:
+                    continue
+            
+            verification['response_time_ms'] = int((time.time() - start_time) * 1000)
+            
+            # Verification criteria:
+            # 1. At least 2 successful requests
+            # 2. At least 50% of requests returned CF-RAY header
+            # 3. OR at least 2 different CF headers detected
+            
+            if successful_requests >= 2:
+                cf_ray_ratio = cf_ray_count / successful_requests
+                
+                if cf_ray_ratio >= 0.5 or len(verification['cf_headers']) >= 2:
+                    verification['is_working_proxy'] = True
+                    verification['cf_ray_present'] = cf_ray_count > 0
+            
+        except Exception as e:
+            verification['error'] = str(e)
+        
+        return verification
+
+    def post_scan_verification(self, max_verify: int = 50, sni: str = None):
+        """
+        Verify the top results after scanning to remove false positives
+        
+        Args:
+            max_verify: Maximum number of results to verify (top results by speed)
+            sni: SNI domain to use for verification
+        """
+        if not self.results:
+            return
+        
+        if not sni:
+            print(f"{Colors.RED}[!] SNI domain required for verification{Colors.END}")
+            return
+        
+        print(f"\n{Colors.CYAN}[*] Post-scan verification starting...{Colors.END}")
+        print(f"{Colors.DIM}[*] Verifying top {min(len(self.results), max_verify)} results{Colors.END}")
+        
+        # Sort by response time (fastest first)
+        sorted_results = sorted(self.results, key=lambda x: x.response_time_ms or 9999)
+        to_verify = sorted_results[:max_verify]
+        
+        verified_results = []
+        failed_verification = []
+        
+        for i, result in enumerate(to_verify, 1):
+            print(f"\r{Colors.DIM}[{i}/{len(to_verify)}] Verifying {result.ip}...{Colors.END}", end="", flush=True)
+            
+            verification = self.verify_proxy(result.ip, sni)
+            
+            if verification['is_working_proxy']:
+                # Update result with verification data
+                result.cf_ray = result.cf_ray or "verified"
+                verified_results.append(result)
+                print(f"\r{Colors.GREEN}[✓] {result.ip} - VERIFIED PROXY{Colors.END}")
+            else:
+                failed_verification.append((result, verification))
+                print(f"\r{Colors.RED}[✗] {result.ip} - Failed verification{Colors.END}")
+        
+        # Update results with only verified ones
+        other_results = self.results[max_verify:]  # Keep unverified results that weren't tested
+        self.results = verified_results + other_results
+        
+        print(f"\n{Colors.GREEN}{'═'*60}{Colors.END}")
+        print(f"{Colors.GREEN}[✓] Verification completed{Colors.END}")
+        print(f"{Colors.GREEN}[✓] Verified working proxies: {len(verified_results)}{Colors.END}")
+        print(f"{Colors.RED}[✗] Failed verification: {len(failed_verification)}{Colors.END}")
+        print(f"{Colors.GREEN}{'═'*60}{Colors.END}")
+        
+        if failed_verification:
+            print(f"\n{Colors.DIM}Failed verification reasons:{Colors.END}")
+            for result, verification in failed_verification[:5]:  # Show first 5
+                reason = verification.get('error', 'No CF headers detected')
+                print(f"{Colors.DIM}  {result.ip}: {reason}{Colors.END}")
+            if len(failed_verification) > 5:
+                print(f"{Colors.DIM}  ... and {len(failed_verification) - 5} more{Colors.END}")
+        
+        input(f"\n{Colors.DIM}Press Enter to continue...{Colors.END}")
+
     def scan(self, ips: List[str], sni: str, callback=None):
-        """Scan list of IPs with specified SNI"""
+        """Scan list of IPs with specified SNI and optional post-verification"""
         self.total = len(ips)
         self.scanned = 0
         self.found = 0
@@ -439,8 +664,9 @@ class GodScanner:
 ║                                                                    ║
 ║  {Colors.YELLOW}[7]{Colors.END}  ⚙️   Settings                                               ║
 ║  {Colors.YELLOW}[8]{Colors.END}  📊  View Results {Colors.CYAN}({found_count} found){Colors.END}                                 ║
-║  {Colors.YELLOW}[9]{Colors.END}  💾  Save Results                                            ║
-║  {Colors.YELLOW}[10]{Colors.END} 📋  Generate VLESS Configs                                  ║
+║  {Colors.YELLOW}[9]{Colors.END}  🔍  Verify Results                                           ║
+║  {Colors.YELLOW}[10]{Colors.END} 💾  Save Results                                            ║
+║  {Colors.YELLOW}[11]{Colors.END} 📋  Generate VLESS Configs                                  ║
 ║                                                                    ║
 ║  {Colors.RED}[0]{Colors.END}  ❌  Exit                                                     ║
 ║                                                                    ║
@@ -498,7 +724,9 @@ class GodScanner:
     def on_found(self, result: ScanResult):
         """Callback when potential proxy found"""
         cf_ray = f" | CF-RAY: {result.cf_ray}" if result.cf_ray else ""
-        print(f"\r{Colors.GREEN}[+] FOUND: {result.ip}:{result.port}{Colors.END} | {result.response_time_ms}ms{cf_ray}")
+        server = f" | Server: {result.server}" if result.server else ""
+        status = f" | HTTP: {result.status_code}" if result.status_code else ""
+        print(f"\r{Colors.GREEN}[+] FOUND: {result.ip}:{result.port}{Colors.END} | {result.response_time_ms}ms{cf_ray}{server}{status}")
 
     def do_scan(self, ips: List[str], description: str):
         """Execute scan with progress display"""
@@ -605,8 +833,20 @@ class GodScanner:
         print(f"{Colors.GREEN}{'═'*60}{Colors.END}")
         
         if self.scanner.found > 0:
-            print(f"\n{Colors.CYAN}These IPs accepted TLS with your SNI.{Colors.END}")
-            print(f"{Colors.DIM}Test them with your VLESS client to verify they work.{Colors.END}")
+            print(f"\n{Colors.CYAN}These IPs passed initial CloudFlare detection.{Colors.END}")
+            
+            # Ask user if they want verification
+            if self.scanner.found <= 100:
+                verify = input(f"\nRun deep verification on results? [Y/n]: ").strip().lower()
+                if verify != 'n':
+                    self.scanner.post_scan_verification(min(self.scanner.found, 50), self.settings['sni'])
+            else:
+                print(f"{Colors.YELLOW}[!] Many results found ({self.scanner.found}). Consider verification.{Colors.END}")
+                verify = input(f"\nRun verification on top 50 results? [Y/n]: ").strip().lower()
+                if verify != 'n':
+                    self.scanner.post_scan_verification(50, self.settings['sni'])
+            
+            print(f"{Colors.DIM}Test verified IPs with your VLESS client.{Colors.END}")
         
         try:
             input(f"\n{Colors.DIM}Press Enter to continue...{Colors.END}")
@@ -1089,41 +1329,17 @@ class GodScanner:
                 return
             elif choice == '1':
                 print(f"\n{Colors.BOLD}SNI Domain{Colors.END}")
-                print(f"{Colors.DIM}Enter a CloudFlare-backed domain for scanning.{Colors.END}")
-                print(f"{Colors.DIM}This domain is used as SNI when connecting to IPs.{Colors.END}")
-                print(f"\n{Colors.YELLOW}If your domain is blocked, use a popular unblocked CF domain:{Colors.END}")
+                print(f"{Colors.DIM}Enter your CloudFlare-backed domain for scanning{Colors.END}")
+                print(f"{Colors.DIM}This domain will be used as SNI when connecting to IPs{Colors.END}")
+                print(f"{Colors.DIM}Example: yourdomain.com, sub.yourdomain.com{Colors.END}\n")
                 
-                # Popular CF domains that are usually not blocked
-                popular_snis = [
-                    "speed.cloudflare.com",
-                    "www.visa.com",
-                    "www.mastercard.com", 
-                    "www.who.int",
-                    "www.unicef.org",
-                    "www.spotify.com",
-                    "www.udemy.com",
-                    "www.canva.com",
-                    "www.medium.com",
-                    "www.notion.so",
-                ]
-                
-                print(f"\n{Colors.CYAN}Popular CF domains (try these if yours is blocked):{Colors.END}")
-                for i, domain in enumerate(popular_snis, 1):
-                    print(f"  {i:>2}. {domain}")
-                
-                print(f"\n{Colors.DIM}Enter domain name, number (1-{len(popular_snis)}), or 'clear' to remove{Colors.END}")
-                
-                val = input(f"\nSNI Domain: ").strip()
-                
+                val = input("SNI Domain (or 'clear' to remove): ").strip().lower()
                 if val == 'clear' or val == '':
                     self.settings['sni'] = ''
                     print(f"{Colors.YELLOW}[✓] SNI cleared{Colors.END}")
-                elif val.isdigit() and 1 <= int(val) <= len(popular_snis):
-                    self.settings['sni'] = popular_snis[int(val) - 1]
-                    print(f"{Colors.GREEN}[✓] SNI set to: {self.settings['sni']}{Colors.END}")
                 else:
                     # Remove protocol if present
-                    val = val.lower().replace('https://', '').replace('http://', '').split('/')[0]
+                    val = val.replace('https://', '').replace('http://', '').split('/')[0]
                     self.settings['sni'] = val
                     print(f"{Colors.GREEN}[✓] SNI set to: {val}{Colors.END}")
                 input(f"{Colors.DIM}Press Enter...{Colors.END}")
@@ -1161,8 +1377,75 @@ class GodScanner:
                     print(f"{Colors.RED}[!] Invalid number{Colors.END}")
                 input(f"{Colors.DIM}Press Enter...{Colors.END}")
 
+    def verify_existing_results(self):
+        """Verify existing results manually"""
+        clear_screen()
+        self.print_banner()
+        
+        print(f"\n{Colors.BOLD}═══ Verify Existing Results ═══{Colors.END}\n")
+        
+        if not self.results:
+            print(f"{Colors.RED}[!] No results to verify{Colors.END}")
+            print(f"{Colors.DIM}Run a scan first to get results{Colors.END}")
+            input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
+            return
+        
+        if not self.settings['sni']:
+            print(f"{Colors.RED}[!] SNI Domain not set{Colors.END}")
+            print(f"{Colors.DIM}Set SNI domain in Settings first{Colors.END}")
+            input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
+            return
+        
+        print(f"Current results: {len(self.results)}")
+        print(f"SNI domain: {self.settings['sni']}")
+        
+        print(f"\n{Colors.BOLD}Verification Options:{Colors.END}")
+        print(f"  {Colors.GREEN}[1]{Colors.END}  Verify all results")
+        print(f"  {Colors.GREEN}[2]{Colors.END}  Verify top 20 fastest")
+        print(f"  {Colors.GREEN}[3]{Colors.END}  Verify top 50 fastest")
+        print(f"  {Colors.GREEN}[4]{Colors.END}  Custom number")
+        print(f"  {Colors.RED}[0]{Colors.END}  Cancel")
+        
+        choice = input(f"\nChoice: ").strip()
+        
+        if choice == '0':
+            return
+        elif choice == '1':
+            max_verify = len(self.results)
+        elif choice == '2':
+            max_verify = min(20, len(self.results))
+        elif choice == '3':
+            max_verify = min(50, len(self.results))
+        elif choice == '4':
+            try:
+                max_verify = int(input("Number to verify: ").strip())
+                max_verify = min(max_verify, len(self.results))
+            except ValueError:
+                print(f"{Colors.RED}[!] Invalid number{Colors.END}")
+                input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
+                return
+        else:
+            return
+        
+        if max_verify <= 0:
+            return
+        
+        print(f"\n{Colors.CYAN}[*] Will verify {max_verify} results{Colors.END}")
+        confirm = input(f"Continue? [Y/n]: ").strip().lower()
+        
+        if confirm == 'n':
+            return
+        
+        # Create a temporary scanner for verification
+        temp_scanner = Scanner(threads=1, timeout=self.settings['timeout'], port=self.settings['port'])
+        temp_scanner.results = self.results.copy()
+        temp_scanner.post_scan_verification(max_verify, self.settings['sni'])
+        
+        # Update our results
+        self.results = temp_scanner.results
+
     def show_results(self):
-        """Display results"""
+        """Display results with verification status"""
         clear_screen()
         self.print_banner()
         
@@ -1174,14 +1457,25 @@ class GodScanner:
             # Sort by latency
             sorted_results = sorted(self.results, key=lambda x: x.response_time_ms or 9999)
             
-            print(f"{'IP':<20} {'Port':<6} {'Latency':<10} {'CF-RAY':<30}")
-            print("─" * 70)
+            print(f"{'IP':<20} {'Port':<6} {'Latency':<10} {'CF-RAY':<15} {'Status':<8} {'Server':<15}")
+            print("─" * 85)
             
             for r in sorted_results:
                 latency = f"{r.response_time_ms}ms" if r.response_time_ms else "N/A"
-                cf_ray = r.cf_ray[:27] + "..." if r.cf_ray and len(r.cf_ray) > 30 else (r.cf_ray or "N/A")
-                print(f"{r.ip:<20} {r.port:<6} {latency:<10} {cf_ray:<30}")
+                cf_ray = (r.cf_ray[:12] + "...") if r.cf_ray and len(r.cf_ray) > 15 else (r.cf_ray or "N/A")
+                status = str(r.status_code) if r.status_code else "N/A"
+                server = (r.server[:12] + "...") if r.server and len(r.server) > 15 else (r.server or "N/A")
+                
+                # Color code based on CF-RAY presence (indicates verification)
+                if r.cf_ray and r.cf_ray != "N/A":
+                    color = Colors.GREEN
+                else:
+                    color = Colors.YELLOW
+                
+                print(f"{color}{r.ip:<20}{Colors.END} {r.port:<6} {latency:<10} {cf_ray:<15} {status:<8} {server:<15}")
             
+            print(f"\n{Colors.GREEN}Green{Colors.END} = Has CF-RAY (likely verified)")
+            print(f"{Colors.YELLOW}Yellow{Colors.END} = No CF-RAY (needs verification)")
             print(f"\n{Colors.DIM}Sorted by latency (fastest first){Colors.END}")
         
         input(f"\n{Colors.DIM}Press Enter...{Colors.END}")
@@ -1443,8 +1737,10 @@ class GodScanner:
                 elif choice == '8':
                     self.show_results()
                 elif choice == '9':
-                    self.save_results()
+                    self.verify_existing_results()
                 elif choice == '10':
+                    self.save_results()
+                elif choice == '11':
                     self.generate_vless()
             except KeyboardInterrupt:
                 # Ctrl+C in main menu = exit
